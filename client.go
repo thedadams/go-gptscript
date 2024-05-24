@@ -5,38 +5,107 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
+)
+
+var (
+	serverProcess       *exec.Cmd
+	serverProcessCancel context.CancelFunc
+	clientCount         int
+	lock                sync.Mutex
 )
 
 const relativeToBinaryPath = "<me>"
 
-type ClientOpts struct {
-	GPTScriptURL string
-	GPTScriptBin string
+type Client interface {
+	Run(context.Context, string, Options) (*Run, error)
+	Evaluate(context.Context, Options, ...fmt.Stringer) (*Run, error)
+	Parse(ctx context.Context, fileName string) ([]Node, error)
+	ParseTool(ctx context.Context, toolDef string) ([]Node, error)
+	Version(ctx context.Context) (string, error)
+	Fmt(ctx context.Context, nodes []Node) (string, error)
+	ListTools(ctx context.Context) (string, error)
+	ListModels(ctx context.Context) ([]string, error)
+	Close()
 }
 
-type Client struct {
-	opts ClientOpts
+type client struct {
+	gptscriptURL string
 }
 
-func NewClient(opts ClientOpts) *Client {
-	c := &Client{opts: opts}
-	c.complete()
-	return c
+func NewClient() (Client, error) {
+	lock.Lock()
+	defer lock.Unlock()
+	clientCount++
+
+	serverURL := os.Getenv("GPTSCRIPT_URL")
+	if serverURL == "" {
+		serverURL = "127.0.0.1:9090"
+	}
+
+	if serverProcessCancel == nil && os.Getenv("GPTSCRIPT_DISABLE_SERVER") != "true" {
+		var ctx context.Context
+		ctx, serverProcessCancel = context.WithCancel(context.Background())
+
+		command := getCommand()
+		serverProcess = exec.CommandContext(ctx, command, "--listen-address", serverURL, "clicky")
+		if err := serverProcess.Start(); err != nil {
+			serverProcessCancel()
+			return nil, fmt.Errorf("failed to start server: %w", err)
+		}
+
+		timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := waitForServerReady(timeoutCtx, serverURL); err != nil {
+			serverProcessCancel()
+			_ = serverProcess.Wait()
+			return nil, fmt.Errorf("failed to wait for gptscript to be ready: %w", err)
+		}
+	}
+	return &client{gptscriptURL: "http://" + serverURL}, nil
 }
 
-func (c *Client) complete() {
-	if c.opts.GPTScriptBin == "" {
-		c.opts.GPTScriptBin = getCommand()
+func waitForServerReady(ctx context.Context, serverURL string) error {
+	for {
+		resp, err := http.Get("http://" + serverURL + "/healthz")
+		if err != nil {
+			slog.DebugContext(ctx, "waiting for server to become ready")
+		} else {
+			_ = resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
 	}
 }
 
-func (c *Client) Evaluate(ctx context.Context, opts Opts, tools ...fmt.Stringer) (*Run, error) {
+func (c *client) Close() {
+	lock.Lock()
+	defer lock.Unlock()
+	clientCount--
+
+	if clientCount == 0 && serverProcessCancel != nil {
+		serverProcessCancel()
+		_ = serverProcess.Wait()
+	}
+}
+
+func (c *client) Evaluate(ctx context.Context, opts Options, tools ...fmt.Stringer) (*Run, error) {
 	return (&Run{
-		url:         c.opts.GPTScriptURL,
-		binPath:     c.opts.GPTScriptBin,
+		url:         c.gptscriptURL,
 		requestPath: "evaluate",
 		state:       Creating,
 		opts:        opts,
@@ -45,10 +114,9 @@ func (c *Client) Evaluate(ctx context.Context, opts Opts, tools ...fmt.Stringer)
 	}).NextChat(ctx, opts.Input)
 }
 
-func (c *Client) Run(ctx context.Context, toolPath string, opts Opts) (*Run, error) {
+func (c *client) Run(ctx context.Context, toolPath string, opts Options) (*Run, error) {
 	return (&Run{
-		url:         c.opts.GPTScriptURL,
-		binPath:     c.opts.GPTScriptBin,
+		url:         c.gptscriptURL,
 		requestPath: "run",
 		state:       Creating,
 		opts:        opts,
@@ -58,8 +126,8 @@ func (c *Client) Run(ctx context.Context, toolPath string, opts Opts) (*Run, err
 }
 
 // Parse will parse the given file into an array of Nodes.
-func (c *Client) Parse(ctx context.Context, fileName string) ([]Node, error) {
-	out, err := c.runBasicCommand(ctx, "parse", "parse", fileName, "")
+func (c *client) Parse(ctx context.Context, fileName string) ([]Node, error) {
+	out, err := c.runBasicCommand(ctx, "parse", fileName, "")
 	if err != nil {
 		return nil, err
 	}
@@ -73,8 +141,8 @@ func (c *Client) Parse(ctx context.Context, fileName string) ([]Node, error) {
 }
 
 // ParseTool will parse the given string into a tool.
-func (c *Client) ParseTool(ctx context.Context, toolDef string) ([]Node, error) {
-	out, err := c.runBasicCommand(ctx, "parse", "parse", "", toolDef)
+func (c *client) ParseTool(ctx context.Context, toolDef string) ([]Node, error) {
+	out, err := c.runBasicCommand(ctx, "parse", "", toolDef)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +156,7 @@ func (c *Client) ParseTool(ctx context.Context, toolDef string) ([]Node, error) 
 }
 
 // Fmt will format the given nodes into a string.
-func (c *Client) Fmt(ctx context.Context, nodes []Node) (string, error) {
+func (c *client) Fmt(ctx context.Context, nodes []Node) (string, error) {
 	b, err := json.Marshal(Document{Nodes: nodes})
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal nodes: %w", err)
@@ -96,8 +164,7 @@ func (c *Client) Fmt(ctx context.Context, nodes []Node) (string, error) {
 
 	run := &runSubCommand{
 		Run: Run{
-			url:         c.opts.GPTScriptURL,
-			binPath:     c.opts.GPTScriptBin,
+			url:         c.gptscriptURL,
 			requestPath: "fmt",
 			state:       Creating,
 			toolPath:    "",
@@ -105,12 +172,7 @@ func (c *Client) Fmt(ctx context.Context, nodes []Node) (string, error) {
 		},
 	}
 
-	if run.url != "" {
-		err = run.request(ctx, Document{Nodes: nodes})
-	} else {
-		err = run.exec(ctx, "fmt")
-	}
-	if err != nil {
+	if err = run.request(ctx, Document{Nodes: nodes}); err != nil {
 		return "", err
 	}
 
@@ -126,8 +188,8 @@ func (c *Client) Fmt(ctx context.Context, nodes []Node) (string, error) {
 }
 
 // Version will return the output of `gptscript --version`
-func (c *Client) Version(ctx context.Context) (string, error) {
-	out, err := c.runBasicCommand(ctx, "--version", "version", "", "")
+func (c *client) Version(ctx context.Context) (string, error) {
+	out, err := c.runBasicCommand(ctx, "version", "", "")
 	if err != nil {
 		return "", err
 	}
@@ -136,8 +198,8 @@ func (c *Client) Version(ctx context.Context) (string, error) {
 }
 
 // ListTools will list all the available tools.
-func (c *Client) ListTools(ctx context.Context) (string, error) {
-	out, err := c.runBasicCommand(ctx, "--list-tools", "list-tools", "", "")
+func (c *client) ListTools(ctx context.Context) (string, error) {
+	out, err := c.runBasicCommand(ctx, "list-tools", "", "")
 	if err != nil {
 		return "", err
 	}
@@ -146,8 +208,8 @@ func (c *Client) ListTools(ctx context.Context) (string, error) {
 }
 
 // ListModels will list all the available models.
-func (c *Client) ListModels(ctx context.Context) ([]string, error) {
-	out, err := c.runBasicCommand(ctx, "--list-models", "list-models", "", "")
+func (c *client) ListModels(ctx context.Context) ([]string, error) {
+	out, err := c.runBasicCommand(ctx, "list-models", "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -155,11 +217,10 @@ func (c *Client) ListModels(ctx context.Context) ([]string, error) {
 	return strings.Split(strings.TrimSpace(out), "\n"), nil
 }
 
-func (c *Client) runBasicCommand(ctx context.Context, command, requestPath, toolPath, content string) (string, error) {
+func (c *client) runBasicCommand(ctx context.Context, requestPath, toolPath, content string) (string, error) {
 	run := &runSubCommand{
 		Run: Run{
-			url:         c.opts.GPTScriptURL,
-			binPath:     c.opts.GPTScriptBin,
+			url:         c.gptscriptURL,
 			requestPath: requestPath,
 			state:       Creating,
 			toolPath:    toolPath,
@@ -167,17 +228,12 @@ func (c *Client) runBasicCommand(ctx context.Context, command, requestPath, tool
 		},
 	}
 
-	var err error
-	if run.url != "" {
-		var m any
-		if content != "" || toolPath != "" {
-			m = map[string]any{"content": content, "file": toolPath}
-		}
-		err = run.request(ctx, m)
-	} else {
-		err = run.exec(ctx, command)
+	var m any
+	if content != "" || toolPath != "" {
+		m = map[string]any{"content": content, "file": toolPath}
 	}
-	if err != nil {
+
+	if err := run.request(ctx, m); err != nil {
 		return "", err
 	}
 
