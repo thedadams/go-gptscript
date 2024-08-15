@@ -7,25 +7,29 @@ type GlobalOptions struct {
 	OpenAIBaseURL        string   `json:"BaseURL"`
 	DefaultModel         string   `json:"DefaultModel"`
 	DefaultModelProvider string   `json:"DefaultModelProvider"`
+	ThreadsStorageDSN    string   `json:"ThreadsStorageDSN"`
 	Env                  []string `json:"env"`
 }
 
 func (g GlobalOptions) toEnv() []string {
-	var args []string
+	var envs []string
 	if g.OpenAIAPIKey != "" {
-		args = append(args, "OPENAI_API_KEY="+g.OpenAIAPIKey)
+		envs = append(envs, "OPENAI_API_KEY="+g.OpenAIAPIKey)
 	}
 	if g.OpenAIBaseURL != "" {
-		args = append(args, "OPENAI_BASE_URL="+g.OpenAIBaseURL)
+		envs = append(envs, "OPENAI_BASE_URL="+g.OpenAIBaseURL)
 	}
 	if g.DefaultModel != "" {
-		args = append(args, "GPTSCRIPT_SDKSERVER_DEFAULT_MODEL="+g.DefaultModel)
+		envs = append(envs, "GPTSCRIPT_SDKSERVER_DEFAULT_MODEL="+g.DefaultModel)
 	}
 	if g.DefaultModelProvider != "" {
-		args = append(args, "GPTSCRIPT_SDKSERVER_DEFAULT_MODEL_PROVIDER="+g.DefaultModelProvider)
+		envs = append(envs, "GPTSCRIPT_SDKSERVER_DEFAULT_MODEL_PROVIDER="+g.DefaultModelProvider)
+	}
+	if g.ThreadsStorageDSN != "" {
+		envs = append(envs, "GPTSCRIPT_SDKSERVER_THREADS_STORAGE_DSN="+g.ThreadsStorageDSN)
 	}
 
-	return args
+	return envs
 }
 
 func completeGlobalOptions(opts ...GlobalOptions) GlobalOptions {
@@ -35,6 +39,7 @@ func completeGlobalOptions(opts ...GlobalOptions) GlobalOptions {
 		result.OpenAIBaseURL = firstSet(opt.OpenAIBaseURL, result.OpenAIBaseURL)
 		result.DefaultModel = firstSet(opt.DefaultModel, result.DefaultModel)
 		result.DefaultModelProvider = firstSet(opt.DefaultModelProvider, result.DefaultModelProvider)
+		result.ThreadsStorageDSN = firstSet(opt.ThreadsStorageDSN, result.ThreadsStorageDSN)
 		result.Env = append(result.Env, opt.Env...)
 	}
 	return result
@@ -61,7 +66,7 @@ type Options struct {
 	CacheDir            string   `json:"cacheDir"`
 	SubTool             string   `json:"subTool"`
 	Workspace           string   `json:"workspace"`
-	ChatState           string   `json:"chatState"`
+	ChatState           any      `json:"chatState"`
 	IncludeEvents       bool     `json:"includeEvents"`
 	Prompt              bool     `json:"prompt"`
 	CredentialOverrides []string `json:"credentialOverrides"`

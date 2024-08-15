@@ -40,7 +40,7 @@ func NewGPTScript(opts ...GlobalOptions) (*GPTScript, error) {
 
 	disableServer := os.Getenv("GPTSCRIPT_DISABLE_SERVER") == "true"
 
-	if serverURL == "" && disableServer {
+	if serverURL == "" {
 		serverURL = os.Getenv("GPTSCRIPT_URL")
 	}
 
@@ -54,7 +54,7 @@ func NewGPTScript(opts ...GlobalOptions) (*GPTScript, error) {
 		ctx, cancel := context.WithCancel(context.Background())
 		in, _ := io.Pipe()
 
-		serverProcess = exec.CommandContext(ctx, getCommand(), "sys.sdkserver", "--listen-address", serverURL)
+		serverProcess = exec.CommandContext(ctx, getCommand(), "--listen-address", serverURL, "sdkserver")
 		serverProcess.Env = opt.Env[:]
 
 		serverProcess.Stdin = in
@@ -134,22 +134,20 @@ func (g *GPTScript) Close() {
 func (g *GPTScript) Evaluate(ctx context.Context, opts Options, tools ...ToolDef) (*Run, error) {
 	opts.Env = append(g.globalEnv, opts.Env...)
 	return (&Run{
-		url:         g.url,
-		requestPath: "evaluate",
-		state:       Creating,
-		opts:        opts,
-		tools:       tools,
+		url:   g.url,
+		state: Creating,
+		opts:  opts,
+		tools: tools,
 	}).NextChat(ctx, opts.Input)
 }
 
 func (g *GPTScript) Run(ctx context.Context, toolPath string, opts Options) (*Run, error) {
 	opts.Env = append(g.globalEnv, opts.Env...)
 	return (&Run{
-		url:         g.url,
-		requestPath: "run",
-		state:       Creating,
-		opts:        opts,
-		toolPath:    toolPath,
+		url:      g.url,
+		state:    Creating,
+		opts:     opts,
+		toolPath: toolPath,
 	}).NextChat(ctx, opts.Input)
 }
 
@@ -291,6 +289,60 @@ func (g *GPTScript) ListModels(ctx context.Context) ([]string, error) {
 	return strings.Split(strings.TrimSpace(out), "\n"), nil
 }
 
+// ListThreads will return a lists of all threads GPTScript has access to.
+func (g *GPTScript) ListThreads(ctx context.Context) ([]Thread, error) {
+	out, err := g.runBasicCommand(ctx, "threads", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	type threadResponse struct {
+		Items []Thread `json:"items"`
+	}
+
+	tr := new(threadResponse)
+	if err = json.Unmarshal([]byte(out), tr); err != nil {
+		return nil, err
+	}
+
+	return tr.Items, nil
+}
+
+// GetThread will return the thread with a given ID
+func (g *GPTScript) GetThread(ctx context.Context, threadID uint64) (*Thread, error) {
+	out, err := g.runBasicCommand(ctx, fmt.Sprintf("threads/%d", threadID), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	tr := new(Thread)
+	if err = json.Unmarshal([]byte(out), tr); err != nil {
+		return nil, err
+	}
+
+	return tr, nil
+}
+
+// ListRuns will return a list of runs in a thread.
+func (g *GPTScript) ListRuns(ctx context.Context, threadID uint64) ([]Run, error) {
+	out, err := g.runBasicCommand(ctx, fmt.Sprintf("threads/%d/runs", threadID), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return restoreRuns(out, g.url)
+}
+
+// RestoreRun will get the run from the threads storage and restore it so it can be used with NextChat.
+func (g *GPTScript) RestoreRun(ctx context.Context, threadID uint64, runID string) (*Run, error) {
+	data, err := g.runBasicCommand(ctx, fmt.Sprintf("threads/%d/runs/%s", threadID, runID), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return restoreRun(data, g.url)
+}
+
 func (g *GPTScript) Confirm(ctx context.Context, resp AuthResponse) error {
 	_, err := g.runBasicCommand(ctx, "confirm/"+resp.ID, resp)
 	return err
@@ -304,12 +356,13 @@ func (g *GPTScript) PromptResponse(ctx context.Context, resp PromptResponse) err
 func (g *GPTScript) runBasicCommand(ctx context.Context, requestPath string, body any) (string, error) {
 	run := &Run{
 		url:          g.url,
-		requestPath:  requestPath,
 		state:        Creating,
 		basicCommand: true,
+		lock:         new(sync.Mutex),
+		callsLock:    new(sync.RWMutex),
 	}
 
-	if err := run.request(ctx, body); err != nil {
+	if err := run.request(ctx, requestPath, body); err != nil {
 		return "", err
 	}
 

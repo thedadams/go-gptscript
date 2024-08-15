@@ -37,16 +37,18 @@ type Frame struct {
 }
 
 type RunFrame struct {
-	ID        string    `json:"id"`
-	Program   Program   `json:"program"`
-	Input     string    `json:"input"`
-	Output    string    `json:"output"`
-	Error     string    `json:"error"`
-	Start     time.Time `json:"start"`
-	End       time.Time `json:"end"`
-	State     RunState  `json:"state"`
-	ChatState any       `json:"chatState"`
-	Type      EventType `json:"type"`
+	ID        string         `json:"id"`
+	ThreadID  uint64         `json:"threadID"`
+	Program   Program        `json:"program"`
+	Input     string         `json:"input"`
+	Output    string         `json:"output"`
+	RawOutput map[string]any `json:"rawOutput"`
+	Error     string         `json:"error"`
+	Start     time.Time      `json:"start"`
+	End       time.Time      `json:"end"`
+	State     RunState       `json:"state"`
+	ChatState any            `json:"chatState"`
+	Type      EventType      `json:"type"`
 }
 
 type CallFrame struct {

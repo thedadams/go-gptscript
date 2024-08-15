@@ -18,30 +18,32 @@ import (
 var errAbortRun = errors.New("run aborted")
 
 type Run struct {
-	url, requestPath, toolPath string
-	tools                      []ToolDef
-	opts                       Options
-	state                      RunState
-	chatState                  string
-	cancel                     context.CancelCauseFunc
-	err                        error
-	wait                       func()
-	basicCommand               bool
+	url, toolPath string
+	tools         []ToolDef
+	opts          Options
+	state         RunState
+	cancel        context.CancelCauseFunc
+	err           error
+	wait          func()
+	basicCommand  bool
 
-	program           *Program
-	callsLock         sync.RWMutex
+	runFrame          *RunFrame
 	calls             map[string]CallFrame
 	parentCallFrameID string
-	rawOutput         map[string]any
+	callsLock         *sync.RWMutex
 	output, errput    string
 	events            chan Frame
-	lock              sync.Mutex
+	lock              *sync.Mutex
 }
 
 // Text returns the text output of the gptscript. It blocks until the output is ready.
 func (r *Run) Text() (string, error) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
+
+	if r.runFrame != nil {
+		return r.runFrame.Output, r.Err()
+	}
 
 	return r.output, r.Err()
 }
@@ -54,6 +56,10 @@ func (r *Run) Bytes() ([]byte, error) {
 
 // State returns the current state of the gptscript.
 func (r *Run) State() RunState {
+	if r.runFrame != nil {
+		return r.runFrame.State
+	}
+
 	return r.state
 }
 
@@ -69,24 +75,27 @@ func (r *Run) Err() error {
 func (r *Run) Program() *Program {
 	r.lock.Lock()
 	defer r.lock.Unlock()
-	return r.program
+	if r.runFrame == nil || r.runFrame.Program.EntryToolID == "" {
+		return nil
+	}
+	p := r.runFrame.Program
+	return &p
 }
 
 // RespondingTool returns the name of the tool that produced the output.
 func (r *Run) RespondingTool() Tool {
 	r.lock.Lock()
 	defer r.lock.Unlock()
-
-	if r.program == nil {
+	if r.runFrame == nil {
 		return Tool{}
 	}
 
-	s, ok := r.rawOutput["toolID"].(string)
+	s, ok := r.runFrame.RawOutput["toolID"].(string)
 	if !ok {
 		return Tool{}
 	}
 
-	return r.program.ToolSet[s]
+	return r.runFrame.Program.ToolSet[s]
 }
 
 // Calls will return a flattened array of the calls for this run.
@@ -141,66 +150,97 @@ func (r *Run) Close() error {
 
 // RawOutput returns the raw output of the gptscript. Most users should use Text or Bytes instead.
 func (r *Run) RawOutput() (map[string]any, error) {
-	if _, err := r.Bytes(); err != nil {
-		return nil, err
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	if r.runFrame != nil {
+		return r.runFrame.RawOutput, r.Err()
 	}
-	return r.rawOutput, nil
+	return nil, r.Err()
 }
 
 // ChatState returns the current chat state of the Run.
 func (r *Run) ChatState() string {
-	return r.chatState
+	cs, _ := r.runFrame.ChatState.(string)
+	return cs
 }
 
 // NextChat will pass input and create the next run in a chat.
 // The new Run will be returned.
 func (r *Run) NextChat(ctx context.Context, input string) (*Run, error) {
-	if r.state != Creating && r.state != Continue && r.state != Error {
-		return nil, fmt.Errorf("run must be in creating, continue, or error state not %q", r.state)
+	runState := r.State()
+	if runState != Creating && runState != Continue && runState != Error {
+		return nil, fmt.Errorf("run must be in creating, continue, or error state not %q", runState)
 	}
 
 	run := &Run{
-		url:         r.url,
-		requestPath: r.requestPath,
-		state:       Creating,
-		toolPath:    r.toolPath,
-		tools:       r.tools,
-		opts:        r.opts,
+		url:       r.url,
+		state:     Creating,
+		opts:      r.opts,
+		lock:      new(sync.Mutex),
+		callsLock: new(sync.RWMutex),
 	}
 
-	run.opts.Input = input
-	if r.chatState != "" && r.state != Error {
-		// If the previous run errored, then don't update the chat state.
-		// opts.ChatState will be the last chat state where an error did not occur.
-		run.opts.ChatState = r.chatState
-	}
-
-	var payload any
-	if len(r.tools) != 0 {
-		payload = requestPayload{
-			ToolDefs: r.tools,
-			Input:    input,
-			Options:  run.opts,
+	if r.runFrame != nil && r.tools == nil && r.toolPath == "" {
+		run.tools = make([]ToolDef, 1, len(r.runFrame.Program.ToolSet))
+		for id, tool := range r.runFrame.Program.ToolSet {
+			if id == r.runFrame.Program.EntryToolID {
+				run.tools[0] = tool.ToolDef
+			} else {
+				run.tools = append(run.tools, tool.ToolDef)
+			}
 		}
-	} else if run.toolPath != "" {
-		payload = requestPayload{
-			File:    run.toolPath,
-			Input:   input,
-			Options: run.opts,
-		}
-	}
-
-	return run, run.request(ctx, payload)
-}
-
-func (r *Run) request(ctx context.Context, payload any) (err error) {
-	if r.state.IsTerminal() {
-		return fmt.Errorf("run is in terminal state and cannot be run again: state %q", r.state)
+	} else {
+		run.tools = r.tools
+		run.toolPath = r.toolPath
 	}
 
 	var (
+		previousRunID uint64
+		threadID      uint64
+	)
+	run.opts.Input = input
+	if r.runFrame != nil {
+		if r.runFrame.ChatState != "" && runState != Error {
+			// If the previous run errored, then don't update the chat state.
+			// opts.ChatState will be the last chat state where an error did not occur.
+			run.opts.ChatState = r.runFrame.ChatState
+		}
+
+		previousRunID, _ = strconv.ParseUint(r.runFrame.ID, 10, 64)
+		threadID = r.runFrame.ThreadID
+	}
+
+	var (
+		payload     any
+		requestPath string
+	)
+	if len(run.tools) != 0 {
+		requestPath = "evaluate"
+		payload = requestPayload{
+			ToolDefs:      run.tools,
+			Input:         input,
+			Options:       run.opts,
+			ThreadID:      threadID,
+			PreviousRunID: previousRunID,
+		}
+	} else if run.toolPath != "" {
+		requestPath = "run"
+		payload = requestPayload{
+			File:          run.toolPath,
+			Input:         input,
+			Options:       run.opts,
+			ThreadID:      threadID,
+			PreviousRunID: previousRunID,
+		}
+	}
+
+	return run, run.request(ctx, requestPath, payload)
+}
+
+func (r *Run) request(ctx context.Context, requestPath string, payload any) (err error) {
+	var (
 		req               *http.Request
-		url               = fmt.Sprintf("%s/%s", r.url, r.requestPath)
+		url               = fmt.Sprintf("%s/%s", r.url, requestPath)
 		cancelCtx, cancel = context.WithCancelCause(ctx)
 	)
 
@@ -223,23 +263,23 @@ func (r *Run) request(ctx context.Context, payload any) (err error) {
 		req, err = http.NewRequestWithContext(cancelCtx, http.MethodPost, url, bytes.NewReader(b))
 	}
 	if err != nil {
-		r.state = Error
+		r.setState(Error)
 		r.err = fmt.Errorf("failed to create request: %w", err)
 		return r.err
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		r.state = Error
+		r.setState(Error)
 		r.err = fmt.Errorf("failed to make request: %w", err)
 		return r.err
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
-		r.state = Error
-		r.err = fmt.Errorf("run encountered an error")
+		r.setState(Error)
+		r.err = fmt.Errorf("run encountered an error, unexpected status code: %d", resp.StatusCode)
 	} else {
-		r.state = Running
+		r.setState(Continue)
 	}
 
 	r.events = make(chan Frame, 100)
@@ -247,12 +287,15 @@ func (r *Run) request(ctx context.Context, payload any) (err error) {
 
 	r.wait = func() {
 		<-cancelCtx.Done()
+		currentRunState := r.State()
 		if err := context.Cause(cancelCtx); !errors.Is(err, context.Canceled) && r.err == nil {
-			r.state = Error
+			currentRunState = Error
 			r.err = err
-		} else if r.state != Continue && r.state != Error {
-			r.state = Finished
+		} else if currentRunState != Continue && currentRunState != Error {
+			currentRunState = Finished
 		}
+
+		r.setState(currentRunState)
 	}
 
 	go func() {
@@ -305,28 +348,30 @@ func (r *Run) request(ctx context.Context, payload any) (err error) {
 						if r.basicCommand {
 							b, err := json.Marshal(out)
 							if err != nil {
-								r.state = Error
+								r.setState(Error)
 								r.err = fmt.Errorf("failed to process basic command output: %w", err)
 								return
 							}
 
 							r.output = string(b)
 						}
+
 						chatState, err := json.Marshal(out["state"])
 						if err != nil {
-							r.state = Error
+							r.setState(Error)
 							r.err = fmt.Errorf("failed to process chat state: %w", err)
 						}
-						r.chatState = string(chatState)
+						if r.runFrame != nil {
+							r.runFrame.ChatState = string(chatState)
+						}
 
 						if content, ok := out["content"].(string); ok {
 							r.output = content
 						}
 
 						done, _ = out["done"].(bool)
-						r.rawOutput = out
 					default:
-						r.state = Error
+						r.setState(Error)
 						r.err = fmt.Errorf("failed to process stdout, invalid type: %T", out)
 						return
 					}
@@ -339,7 +384,7 @@ func (r *Run) request(ctx context.Context, payload any) (err error) {
 							r.errput = out
 						}
 					default:
-						r.state = Error
+						r.setState(Error)
 						r.err = fmt.Errorf("failed to process stderr, invalid type: %T", out)
 					}
 				} else {
@@ -349,7 +394,7 @@ func (r *Run) request(ctx context.Context, payload any) (err error) {
 					}
 
 					if event.Prompt != nil && !r.opts.Prompt {
-						r.state = Error
+						r.setState(Error)
 						r.err = fmt.Errorf("prompt event occurred when prompt was not allowed: %s", event.Prompt)
 						// Ignore the error because it is the same as the above error.
 						_ = r.Close()
@@ -365,12 +410,11 @@ func (r *Run) request(ctx context.Context, payload any) (err error) {
 						}
 						r.callsLock.Unlock()
 					} else if event.Run != nil {
-						if event.Run.Type == EventTypeRunStart {
-							r.callsLock.Lock()
-							r.program = &event.Run.Program
-							r.callsLock.Unlock()
-						} else if event.Run.Type == EventTypeRunFinish && event.Run.Error != "" {
-							r.state = Error
+						r.callsLock.Lock()
+						r.runFrame = event.Run
+						r.callsLock.Unlock()
+						if event.Run.Type == EventTypeRunFinish && event.Run.Error != "" {
+							r.setState(Error)
 							r.err = fmt.Errorf("%s", event.Run.Error)
 						}
 					}
@@ -388,15 +432,22 @@ func (r *Run) request(ctx context.Context, payload any) (err error) {
 		}
 
 		if r.err != nil {
-			r.state = Error
+			r.setState(Error)
 		} else if done {
-			r.state = Finished
+			r.setState(Finished)
 		} else {
-			r.state = Continue
+			r.setState(Continue)
 		}
 	}()
 
 	return nil
+}
+
+func (r *Run) setState(s RunState) {
+	r.state = s
+	if r.runFrame != nil {
+		r.runFrame.State = s
+	}
 }
 
 type RunState string
@@ -414,8 +465,53 @@ const (
 )
 
 type requestPayload struct {
-	Options  `json:",inline"`
-	File     string    `json:"file"`
-	Input    string    `json:"input"`
-	ToolDefs []ToolDef `json:"toolDefs,inline"`
+	Options       `json:",inline"`
+	File          string    `json:"file"`
+	Input         string    `json:"input"`
+	ToolDefs      []ToolDef `json:"toolDefs,inline"`
+	ThreadID      uint64    `json:"threadID"`
+	PreviousRunID uint64    `json:"previousRunID"`
+}
+
+type restoreRunResponse struct {
+	RunFrame          *RunFrame            `json:"runFrame"`
+	Calls             map[string]CallFrame `json:"calls"`
+	ParentCallFrameID string               `json:"parentCallFrameID"`
+}
+
+type listRunsResponse struct {
+	Items []restoreRunResponse `json:"items"`
+}
+
+func restoreRun(data, url string) (*Run, error) {
+	restoredRun := new(restoreRunResponse)
+	if err := json.Unmarshal([]byte(data), restoredRun); err != nil {
+		return nil, err
+	}
+
+	return &Run{
+		url:               url,
+		runFrame:          restoredRun.RunFrame,
+		calls:             restoredRun.Calls,
+		parentCallFrameID: restoredRun.ParentCallFrameID,
+	}, nil
+}
+
+func restoreRuns(data, url string) ([]Run, error) {
+	restoredRuns := new(listRunsResponse)
+	if err := json.Unmarshal([]byte(data), &restoredRuns); err != nil {
+		return nil, err
+	}
+
+	runs := make([]Run, 0, len(restoredRuns.Items))
+	for _, restoredRun := range restoredRuns.Items {
+		runs = append(runs, Run{
+			url:               url,
+			runFrame:          restoredRun.RunFrame,
+			calls:             restoredRun.Calls,
+			parentCallFrameID: restoredRun.ParentCallFrameID,
+		})
+	}
+
+	return runs, nil
 }

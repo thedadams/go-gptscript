@@ -20,7 +20,7 @@ func TestMain(m *testing.M) {
 	}
 
 	var err error
-	g, err = NewGPTScript(GlobalOptions{OpenAIAPIKey: os.Getenv("OPENAI_API_KEY")})
+	g, err = NewGPTScript(GlobalOptions{OpenAIAPIKey: os.Getenv("OPENAI_API_KEY"), ThreadsStorageDSN: "sqlite://gptscript-threads.db"})
 	if err != nil {
 		panic(fmt.Sprintf("error creating gptscript: %s", err))
 	}
